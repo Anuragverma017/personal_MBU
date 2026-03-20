@@ -1,4 +1,3 @@
-# updated login.py bot join count file 20/03/2026
 import os
 import re
 import calendar
