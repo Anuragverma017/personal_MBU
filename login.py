@@ -1,6 +1,9 @@
+# updated login.py bot join count file 20/03/2026
 import os
 import re
 import calendar
+import time
+import random
 
 import asyncio
 from datetime import datetime, timezone, timedelta
@@ -9,10 +12,19 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from telethon import TelegramClient, events, errors, Button
 from telethon import types as tl_types  # for User/Chat/Channel/UpdateBotChatInviteRequester, InputUserEmpty
+from telethon.tl.types import (
+    UpdateChannelParticipant,
+    ChannelParticipantBanned,
+    ChannelParticipantLeft,
+)
 from telethon.tl import functions, types
 from telethon.utils import get_peer_id
 import logging
 from error_handler import safe_event_handler, log_info, log_error, log_warning
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')  # use non-interactive backend
+from openpyxl import Workbook
 # ---------------- ENV & GLOBALS ----------------
 
 load_dotenv()
@@ -23,7 +35,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 # allow either SUPABASE_KEY or SUPABASE_SERVICE_ROLE_KEY
-SUPABASE_KEY = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
 SESSION_DIR = os.getenv("SESSION_DIR", "sessions")
 TOP_N = 14  # how many pinned chats to show in selection
@@ -40,7 +52,8 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ---------------- SUPABASE + SUBSCRIPTION HELPERS ----------------
 
-bot = TelegramClient("join_counter_bot", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+# Create the bot client but don't start it yet (lazy start inside async loop)
+bot = TelegramClient("join_counter_bot", API_ID, API_HASH)
 
 # ---- in-memory state ----
 login_state: Dict[int, Dict[str, Any]] = {}
@@ -48,8 +61,19 @@ select_state: Dict[int, Dict[str, Any]] = {}   # selection flows (create/remove 
 # create link preference (approve vs normal)
 create_link_pref: Dict[int, str] = {}  # uid -> "approval" | "normal"
 USER_CLIENT_CACHE: Dict[int, TelegramClient] = {}
+ACTIVE_LISTENERS: Set[int] = set()            # uids with active ChatAction listeners
 stats_state: Dict[int, Dict[str, Any]] = {}    # stats link selection context
 date_select_state: Dict[int, Dict[str, Any]] = {}  # uid -> {step, link_id, month, year, start_date, end_date, ...}
+
+# ---------- Invite-link cache (avoid DB hit on every event) ----------
+# Tuple: (rows, monotonic_timestamp)
+_invite_link_cache: Dict[int, Tuple[List[dict], float]] = {}
+CACHE_TTL: float = 60.0  # seconds
+
+# ---------- Async sync queue (deferred importer sync) ----------
+_sync_queue: asyncio.Queue = asyncio.Queue()
+_pending_syncs: Set[Tuple[int, int]] = set()  # (uid, chat_id) dedup
+_sync_worker_started: bool = False
 
 # per-message stats pagination state
 stats_pages: Dict[Tuple[int, int], Dict[str, Any]] = {}
@@ -82,7 +106,9 @@ async def safe_connect(client: TelegramClient, retries: int = 3, delay: int = 2)
             last_exc = exc
             if attempt < retries:
                 await asyncio.sleep(delay * attempt)
-    raise last_exc or RuntimeError("safe_connect: failed to connect")
+    if isinstance(last_exc, BaseException):
+        raise last_exc
+    raise RuntimeError("safe_connect: failed to connect")
 
 
 def title_of(ent) -> str:
@@ -246,6 +272,8 @@ def sp_save_invite_link(
         },
         on_conflict="user_id,chat_id,invite_link",
     ).execute()
+    # Invalidate cache so next lookup fetches fresh data
+    invalidate_invite_link_cache(uid)
 
 
 def sp_list_invite_links(uid: int) -> List[dict]:
@@ -280,6 +308,123 @@ def sp_soft_delete_links(uid: int, link_ids: List[int]):
         .eq("user_id", uid) \
         .in_("id", link_ids) \
         .execute()
+
+    # Invalidate cache so removed links are no longer served
+    invalidate_invite_link_cache(uid)
+
+
+# ---------------------------------------------------------------------------
+# INVITE LINK CACHE  — avoid DB hit on every real-time event
+# ---------------------------------------------------------------------------
+
+def invalidate_invite_link_cache(uid: int) -> None:
+    """Drop the cached invite links for a user (call after create/remove)."""
+    _invite_link_cache.pop(uid, None)
+
+
+def get_cached_invite_links(uid: int) -> List[dict]:
+    """
+    Return the invite links for uid from cache (TTL = CACHE_TTL seconds).
+    Falls back to Supabase on cache miss or expiry.
+    """
+    entry = _invite_link_cache.get(uid)
+    if entry is not None:
+        rows, ts = entry
+        if time.monotonic() - ts < CACHE_TTL:
+            return rows
+    rows = sp_list_invite_links(uid)
+    _invite_link_cache[uid] = (rows, time.monotonic())
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# REAL-TIME IMMEDIATE JOIN INSERT
+# ---------------------------------------------------------------------------
+
+def sp_realtime_join_insert(
+    uid: int,
+    chat_id: int,
+    joined_user_id: int,
+    invite_link_id: Optional[int] = None,
+    joined_source: str = "realtime",
+) -> None:
+    """
+    Insert/upsert a join row immediately on a real-time event.
+
+    - invite_link_id may be NULL if we cannot determine the exact link yet;
+      the background sync queue will later fill in the correct value.
+    - Uses UNIQUE(user_id, chat_id, joined_user_id) conflict target so that
+      if the row already exists (e.g. from a previous sync) we only update
+      join metadata — we deliberately do NOT overwrite left_at.
+    - joined_source is stored for debugging ("realtime" or "sync").
+    """
+    now_iso = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "user_id": uid,
+        "chat_id": chat_id,
+        "joined_user_id": joined_user_id,
+        "joined_at": now_iso,
+        "left_at": None,
+        "left_reason": None,
+        "left_seen_at": None,
+        "joined_source": joined_source,
+    }
+    if invite_link_id is not None:
+        payload["invite_link_id"] = invite_link_id
+
+    try:
+        supabase.table("joins").upsert(
+            payload,
+            on_conflict="user_id,chat_id,joined_user_id",
+        ).execute()
+    except Exception as ex:
+        log_error(f"sp_realtime_join_insert error uid={uid} joined_user={joined_user_id}: {ex}")
+
+
+# ---------------------------------------------------------------------------
+# ASYNC SYNC QUEUE WORKER
+# ---------------------------------------------------------------------------
+
+async def _sync_worker() -> None:
+    """
+    Background coroutine that drains the sync queue.
+
+    Each item in the queue is (uid, chat_id).  Duplicate (uid, chat_id)
+    pairs that arrive while one is already processing are discarded to
+    avoid redundant Telegram API calls.
+    A small random sleep (0.3 – 0.5 s) between API calls enforces the
+    rate-limit budget.
+    """
+    while True:
+        uid, chat_id = await _sync_queue.get()
+        key = (uid, chat_id)
+        try:
+            links = get_cached_invite_links(uid)
+            chat_links = [r for r in links if int(r.get("chat_id", 0)) == chat_id]
+            for link_row in chat_links:
+                try:
+                    await sync_importers_to_db(uid, only_link_id=int(link_row["id"]))
+                except Exception as ex:
+                    log_error(f"_sync_worker sync error uid={uid} link={link_row['id']}: {ex}")
+                await asyncio.sleep(random.uniform(0.3, 0.5))
+        except Exception as ex:
+            log_error(f"_sync_worker outer error uid={uid} chat={chat_id}: {ex}")
+        finally:
+            _pending_syncs.discard(key)
+            _sync_queue.task_done()
+
+
+def enqueue_sync(uid: int, chat_id: int) -> None:
+    """Enqueue a deferred importer sync for (uid, chat_id) if not already pending."""
+    key = (uid, chat_id)
+    if key not in _pending_syncs:
+        _pending_syncs.add(key)
+        try:
+            _sync_queue.put_nowait((uid, chat_id))
+        except asyncio.QueueFull:
+            _pending_syncs.discard(key)
+            log_warning(f"enqueue_sync: queue full, dropping uid={uid} chat={chat_id}")
+
 
 
 def sp_replace_joins_for_link(uid: int, invite_link_id: int, rows: List[dict]):
@@ -409,86 +554,6 @@ def _safe_ascii(s: str) -> str:
 
 from telethon.errors import UserNotParticipantError
 from telethon.errors.rpcerrorlist import ChatAdminRequiredError
-import asyncio
-
-async def reconcile_left_for_link(uid: int, invite_link_id: int, batch_limit: int = 300) -> tuple[int, int]:
-    """
-    For a specific invite_link_id:
-    - Fetch users in joins table where left_at IS NULL
-    - Check if they are still a participant in the chat
-    - If not, set left_at/left_reason/left_seen_at
-    Returns: (fixed_left_count, checked_count)
-    """
-    # 1) Find the link row to get chat_id
-    rows = sp_list_invite_links(uid)
-    link_row = next((r for r in rows if int(r.get("id", 0)) == int(invite_link_id)), None)
-    if not link_row:
-        return (0, 0)
-
-    chat_id = int(link_row["chat_id"])
-
-    # 2) Get Telethon client
-    uc = await get_user_client(uid)
-    peer = await uc.get_input_entity(chat_id)
-
-    # 3) Fetch a batch of "currently joined" users from DB
-    # left_at null = currently joined (as per DB)
-    # We reconcile only a limited batch to keep it fast.
-    q = (
-        supabase.table("joins")
-        .select("id,joined_user_id,left_at")
-        .eq("user_id", uid)
-        .eq("invite_link_id", invite_link_id)
-        .is_("left_at", None)
-        .limit(batch_limit)
-        .execute()
-    )
-
-    data = q.data or []
-    if not data:
-        return (0, 0)
-
-    fixed = 0
-    checked = 0
-
-    for row in data:
-        checked += 1
-        member_uid = int(row["joined_user_id"])
-        join_row_id = row["id"]
-
-        try:
-            # If still participant => nothing to do
-            await uc(functions.channels.GetParticipantRequest(
-                channel=peer,
-                participant=member_uid
-            ))
-        except UserNotParticipantError:
-            # Not a member anymore => mark left
-            now_iso = datetime.now(timezone.utc).isoformat()
-            supabase.table("joins").update({
-                "left_at": now_iso,
-                "left_reason": "reconciled_left",
-                "left_seen_at": now_iso,
-            }).eq("id", join_row_id).execute()
-            fixed += 1
-
-        except ChatAdminRequiredError:
-            # If account isn't admin, participant check may fail
-            # In that case we cannot reliably reconcile
-            print("Reconcile error: Admin rights required to check participants.")
-            break
-
-        except Exception as ex:
-            # Flood / temporary errors
-            # Silently skip - these are expected (deleted accounts, privacy restrictions)
-            # Uncomment below to debug: print("Reconcile member check error:", ex)
-            pass
-
-        # Small delay to avoid Telegram flood
-        await asyncio.sleep(0.2)
-
-    return (fixed, checked)
-
 
 
 async def render_stats_page(event, uid: int, ctx: Dict[str, Any]):
@@ -576,6 +641,8 @@ async def get_user_client(uid: int) -> TelegramClient:
 
     if not await client.is_user_authorized():
         await client.disconnect()
+        # Mark as inactive to avoid redundant connection attempts
+        sp_delete_session(uid)
         raise RuntimeError("Session exists but not authorized. /login again.")
 
     USER_CLIENT_CACHE[uid] = client
@@ -617,7 +684,6 @@ def commands_text() -> str:
         "📅 /today_status — Joins today",
         "📆 /week_status — Joins in last 7 days",
         "🗓️ /month_status — Joins in last 30 days",
-        "📈 /year_status — Joins in last 365 days",
         "",
         "🔐 /login — Login your Telegram account",
         "🛑 /stoplogin — Cancel login process",
@@ -629,6 +695,73 @@ def commands_text() -> str:
         "_Flow: /login → /create_link → share invite link → /stats for join tracking._",
     ]
     return "\n".join(lines)
+
+
+# ---------------- REPORT GENERATION HELPERS ----------------
+
+def generate_today_text_report(data_rows: List[dict]) -> str:
+    now_ist = datetime.now(timezone(timedelta(hours=5, minutes=30))).strftime("%d-%m-%Y at %I:%M %p")
+    text = f"📌 **Daily Join Report for {now_ist}**\n\n"
+    text += "Sl. No. — Link — Joins\n\n"
+
+    for i, row in enumerate(data_rows, start=1):
+        title = row["chat_title"]
+        count = row["count"]
+        text += f"{i}. `{title}` — `{count}`\n"
+
+    if not data_rows:
+        text += "_No joins recorded today._"
+
+    return text
+
+
+def generate_today_excel_report(data_rows: List[dict]) -> str:
+    now_str = datetime.now().strftime("%d-%m-%Y")
+    file_name = f"Daily_Report_{now_str}.xlsx"
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Today's Joins"
+
+    ws.append(["Sl No", "Link Title", "Invite Link", "Joins Today"])
+
+    for i, row in enumerate(data_rows, start=1):
+        ws.append([i, row["chat_title"], row["invite_link"], row["count"]])
+
+    wb.save(file_name)
+    return file_name
+
+
+def generate_today_graph_report(data_rows: List[dict]) -> str:
+    if not data_rows:
+        return ""
+
+    titles = [ (row["chat_title"][:10] + "...") if len(row["chat_title"]) > 10 else row["chat_title"] for row in data_rows]
+    counts = [row["count"] for row in data_rows]
+
+    # Use a nice color palette
+    colors = ['#FF5733','#33C1FF','#28B463','#F39C12','#8E44AD','#1ABC9C']
+    bar_colors = [colors[i % len(colors)] for i in range(len(titles))]
+
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(titles, counts, color=bar_colors)
+
+    # Values on top
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height + 0.1, str(int(height)), ha='center', va='bottom')
+
+    plt.xlabel("Links")
+    plt.ylabel("Joins Today")
+    plt.title(f"Join Report for {datetime.now().strftime('%d-%m-%Y')}")
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+
+    file_name = "today_graph.png"
+    plt.savefig(file_name)
+    plt.close()
+
+    return file_name
 
 # 👆 Button import already hoga, agar nahi hai to ye line ensure karo
 
@@ -666,163 +799,6 @@ async def help_cmd(e):
     await e.respond(txt, parse_mode="md")
 
 
-# ---------------- RECONCILE LEFT (TELETHON) ----------------
-
-@bot.on(events.NewMessage(pattern=r"^/reconcile_left$"))
-async def reconcile_left_cmd(e):
-    uid = e.sender_id
-    if not await is_logged_in(uid):
-        return await e.respond("🔒 Please /login first.", parse_mode="md")
-
-    rows = sp_list_invite_links(uid)
-    if not rows:
-        return await e.respond("❌ No links found. Pehle /create_link se link banao.", parse_mode="md")
-
-    btn_rows: List[List[Button]] = []
-    for r in rows[:10]:
-        title = r.get("chat_title") or f"id:{r.get('chat_id')}"
-        short = (title[:40] + "…") if len(title) > 40 else title
-        btn_rows.append([Button.inline(short, data=f"reconcile_link:{int(r['id'])}".encode())])
-
-    btn_rows.append([Button.inline("✖ Cancel", data=b"reconcile_cancel")])
-
-    await e.respond(
-        "🛠️ **Left Reconcile Mode**\n\nKis link ka left verify karke DB update karna hai? 👇",
-        parse_mode="md",
-        buttons=btn_rows
-    )
-# ---------------- RECONCILE ALL (CONFIRM + HEAVY PROCESS) ----------------
-
-async def reconcile_left_for_all_links(uid: int, per_link_batch: int = 300) -> tuple[int, int, int]:
-    """
-    Reconcile ALL invite links created by this user.
-    Returns: (total_fixed, total_checked, links_processed)
-    """
-    rows = sp_list_invite_links(uid)
-    if not rows:
-        return (0, 0, 0)
-
-    total_fixed = 0
-    total_checked = 0
-    links_processed = 0
-
-    for r in rows:
-        link_id = int(r.get("id", 0) or 0)
-        if not link_id:
-            continue
-
-        fixed, checked = await reconcile_left_for_link(
-            uid,
-            link_id,
-            batch_limit=per_link_batch
-        )
-
-        total_fixed += fixed
-        total_checked += checked
-        links_processed += 1
-
-        # Small pause to reduce flood / rate-limit risk across multiple links
-        await asyncio.sleep(0.4)
-
-    return (total_fixed, total_checked, links_processed)
-
-
-@bot.on(events.NewMessage(pattern=r"^/reconcile_all$"))
-async def reconcile_all_cmd(e):
-    uid = e.sender_id
-
-    if not await is_logged_in(uid):
-        return await e.respond(
-            "🔒 Please run /login first to continue.",
-            parse_mode="md"
-        )
-
-    rows = sp_list_invite_links(uid)
-    if not rows:
-        return await e.respond(
-            "❌ No invite links found. Please create a link using /create_link first.",
-            parse_mode="md"
-        )
-
-    await e.respond(
-        "⚠️ **Are you sure you want to reconcile ALL your invite links?**\n\n"
-        "This is a **heavy process** and may take a significant amount of time, "
-        "depending on the total number of links you have created.\n\n"
-        "⏳ Please be patient and wait for **a few minutes** until the process completes.\n\n"
-        f"📌 Total links found: `{len(rows)}`",
-        parse_mode="md",
-        buttons=[
-            [
-                Button.inline("✖ NO", data=b"reconcile_all_no"),
-                Button.inline("✅🔁 Reconcile Now", data=b"reconcile_all_yes"),
-            ]
-        ],
-    )
-
-
-@bot.on(events.CallbackQuery(pattern=b"^reconcile_all_no$"))
-async def cb_reconcile_all_no(event):
-    await event.edit(
-        "✖ Operation cancelled. Reconcile all process has been stopped.",
-        buttons=None
-    )
-
-
-@bot.on(events.CallbackQuery(pattern=b"^reconcile_all_yes$"))
-async def cb_reconcile_all_yes(event):
-    uid = event.sender_id
-
-    await event.edit(
-        "⏳ **Reconciling all your invite links…**\n\n"
-        "Please wait for a few minutes.\n"
-        "This process may take longer if you have created many links.",
-        parse_mode="md",
-        buttons=None,
-    )
-
-    total_fixed, total_checked, links_processed = await reconcile_left_for_all_links(
-        uid,
-        per_link_batch=400
-    )
-
-    await event.edit(
-        "✅ **Reconcile All Completed Successfully**\n\n"
-        f"🔗 Links processed: `{links_processed}`\n"
-        f"👤 Users checked: `{total_checked}`\n"
-        f"🚪 Left users fixed (marked as left): `{total_fixed}`\n\n"
-        "ℹ️ Tip: If you have a very large number of users, you can run /reconcile_all again "
-        "to continue reconciling the next batches.",
-        parse_mode="md",
-        buttons=[[Button.inline("✖ Close", data=b"stats_page:close")]],
-    )
-
-
-@bot.on(events.CallbackQuery(pattern=b"^reconcile_link:"))
-async def cb_reconcile_left(event):
-    uid = event.sender_id
-    try:
-        link_id = int(event.data.decode().split(":")[1])
-    except Exception:
-        return await event.answer("Invalid link.", alert=True)
-
-    await event.edit("⏳ Checking Telegram members… (left reconcile running)", buttons=None)
-
-    fixed, checked = await reconcile_left_for_link(uid, link_id, batch_limit=300)
-
-    await event.edit(
-        f"✅ **Reconcile Done**\n\n"
-        f"Checked: `{checked}`\n"
-        f"Marked Left (fixed): `{fixed}`\n\n"
-        f"Tip: Agar users bahut zyada hain toh command dubara run karo (next batch fix ho jayega).",
-        parse_mode="md",
-        buttons=[[Button.inline("✖ Close", data=b"stats_page:close")]]
-    )
-
-
-@bot.on(events.CallbackQuery(pattern=b"^reconcile_cancel$"))
-async def cb_reconcile_cancel(event):
-    await event.edit("✖ Reconcile cancelled.", buttons=None)
-
 
 @bot.on(events.NewMessage(pattern=r"^/status$"))
 async def status_cmd(e):
@@ -854,7 +830,7 @@ async def login_cmd(e):
     await e.respond(
         "📲 Send your phone number in this format:\n\n"
         "`+919876543210`\n\n"
-        "You can cancel anytime with `/stoplogin`.",
+        "You can cancel anytime with /stoplogin .",
         parse_mode="md",
     )
 
@@ -864,7 +840,7 @@ async def stoplogin_cmd(e):
     uid = e.sender_id
     if uid in login_state:
         login_state.pop(uid, None)
-        await e.respond("✖ Login cancelled. You can start again with `/login`.")
+        await e.respond("✖ Login cancelled. You can start again with /login .")
         return
     await e.respond("ℹ️ No login in progress.")
 
@@ -900,11 +876,12 @@ async def login_flow(e):
                     parse_mode="md",
                 )
                 login_state.pop(uid, None)
+                asyncio.ensure_future(_start_listener_after_login(uid))
                 return
             res = await client.send_code_request(phone)
             st["phone_code_hash"] = getattr(res, "phone_code_hash", None)
             await e.respond(
-                "📩 Send OTP in this format: `HELLO123456` .\n\n"
+                "📩 Send OTP in this format: `123456` or `HELLO123456`.\n\n"
                 "You can also tap *Resend OTP* if needed.",
                 parse_mode="md",
                 buttons=[[Button.inline("🔁 Resend OTP", data=b"resend_otp")]],
@@ -912,7 +889,7 @@ async def login_flow(e):
             st["step"] = "otp"
         except Exception as ex:
             await e.respond(
-                f"❌ OTP send error: `{ex}`\nStart again with `/login`.",
+                f"❌ OTP send error: `{ex}`\nStart again with /login.",
                 parse_mode="md",
             )
         finally:
@@ -935,14 +912,14 @@ async def login_flow(e):
         if not phone:
             login_state.pop(uid, None)
             return await e.respond(
-                "⚠️ Phone missing. Start `/login` again.",
+                "⚠️ Phone missing. Start /login again.",
                 parse_mode="md",
             )
         code_hash = st.get("phone_code_hash")
         if not code_hash:
             login_state.pop(uid, None)
             return await e.respond(
-                "❌ Code session expired. `/login` again.",
+                "❌ Code session expired. /login again.",
                 parse_mode="md",
             )
 
@@ -960,6 +937,7 @@ async def login_flow(e):
                     parse_mode="md",
                 )
                 login_state.pop(uid, None)
+                asyncio.ensure_future(_start_listener_after_login(uid))
                 return
             except errors.SessionPasswordNeededError:
                 try:
@@ -977,10 +955,10 @@ async def login_flow(e):
                 )
                 return
         except errors.PhoneCodeInvalidError:
-            await e.respond("❌ Wrong OTP. `/login` try again.", parse_mode="md")
+            await e.respond("❌ Wrong OTP. /login try again.", parse_mode="md")
         except Exception as ex:
             await e.respond(
-                f"❌ Login failed: `{ex}`\nStart again with `/login`.",
+                f"❌ Login failed: `{ex}`\nStart again with /login.",
                 parse_mode="md",
             )
         finally:
@@ -1012,14 +990,15 @@ async def login_flow(e):
                 "Now use /create_link to generate invite links.",
                 parse_mode="md",
             )
+            asyncio.ensure_future(_start_listener_after_login(uid))
         except errors.PasswordHashInvalidError:
             return await e.respond(
-                "❌ Wrong password, try again (or `/login` to restart).",
+                "❌ Wrong password, try again (or /login to restart).",
                 parse_mode="md",
             )
         except Exception as ex:
             await e.respond(
-                f"❌ 2FA login failed: `{ex}`\nUse `/login` to reset.",
+                f"❌ 2FA login login failed: `{ex}`\nUse /login to reset.",
                 parse_mode="md",
             )
         finally:
@@ -1101,7 +1080,7 @@ def build_calendar_kb(year: int, month: int, selected_start: Optional[str], sele
 @bot.on(events.CallbackQuery(pattern=b"menu_login"))
 async def cb_menu_login(event):
     await event.answer()
-    await event.respond("👤 Login ke liye command use karo:\n\n`/login`\n\nYahi se tum apna Telegram account connect karoge.", parse_mode="md")
+    await event.respond("👤 Login ke liye command use karo:\n\n/login\n\nYahi se tum apna Telegram account connect karoge.", parse_mode="md")
 
 @bot.on(events.CallbackQuery(pattern=b"menu_create_link"))
 async def cb_menu_create_link(event):
@@ -1111,7 +1090,7 @@ async def cb_menu_create_link(event):
 @bot.on(events.CallbackQuery(pattern=b"menu_links"))
 async def cb_menu_links(event):
     await event.answer()
-    await event.respond("📋 Apne sab active links dekhne ke liye:\n\n`/links`", parse_mode="md")
+    await event.respond("📋 Apne sab active links dekhne ke liye:\n\n/links", parse_mode="md")
 
 @bot.on(events.CallbackQuery(pattern=b"menu_stats"))
 async def cb_menu_stats(event):
@@ -1139,7 +1118,7 @@ async def cb_resend_otp(event):
             buttons=[[Button.inline("🔁 Resend OTP", data=b"resend_otp")]],
         )
     except Exception as ex:
-        await event.edit(f"❌ Resend failed: `{ex}`\nStart `/login` again.")
+        await event.edit(f"❌ Resend failed: `{ex}`\nStart /login again.")
     finally:
         try:
             await client.disconnect()
@@ -1185,7 +1164,7 @@ async def logout_confirm_cb(event):
         except Exception as ex:
             print("remove session file err:", ex)
     sp_delete_session(uid)
-    await event.edit("👋 Logged out. You can `/login` again anytime.", buttons=None)
+    await event.edit("👋 Logged out. You can /login again anytime.", buttons=None)
 
 
 @bot.on(events.CallbackQuery(pattern=b"logout_cancel"))
@@ -1227,7 +1206,7 @@ async def select_date_cmd(e):
 
     rows = sp_list_invite_links(uid)
     if not rows:
-        return await e.respond("ℹ️ No active invite links. Use `/create_link` first.", parse_mode="md")
+        return await e.respond("ℹ️ No active invite links. Use /create_link first.", parse_mode="md")
 
     # store state
     now = datetime.now(timezone.utc)
@@ -1256,7 +1235,7 @@ async def cb_pin_create_links(event):
     try:
         uc = await get_user_client(uid)
     except Exception as ex:
-        return await event.edit(f"❌ {ex}\nUse `/login` again.", buttons=None)
+        return await event.edit(f"❌ {ex}\nUse /login again.", buttons=None)
 
     pairs = await top_dialog_pairs(uc, TOP_N)
     if not pairs:
@@ -1579,7 +1558,7 @@ async def cb_msel_done(event):
         if not link_ids:
             select_state.pop(uid, None)
             return await event.edit(
-                "ℹ️ Nothing selected. Use `/remove_link` again.",
+                "ℹ️ Nothing selected. Use /remove_link again.",
                 buttons=None,
             )
 
@@ -1806,7 +1785,7 @@ async def sync_importers_to_db(uid: int, only_link_id: Optional[int] = None) -> 
     Sync from Telegram -> DB
     Returns dict: {invite_link_id: upserted_count}
     """
-    rows = sp_list_invite_links(uid)
+    rows = get_cached_invite_links(uid)
     if not rows:
         return {}
 
@@ -1872,107 +1851,234 @@ async def sync_importers_to_db(uid: int, only_link_id: Optional[int] = None) -> 
             continue
 
         join_rows: List[dict] = []
-        for joined_user_id, joined_at in merged.items():
+        for joined_user_id_int, joined_at in merged.items():
             join_rows.append(
                 {
                     "user_id": int(uid),
                     "chat_id": int(chat_id),
                     "invite_link_id": int(invite_link_id),
-                    "joined_user_id": int(joined_user_id),
+                    "joined_user_id": int(joined_user_id_int),
                     "joined_at": joined_at.isoformat(),
+                    "joined_source": "sync",  # ✅ debugging field
                 }
             )
+
+        # ✅ Skip users whose left_at is already set in DB (do not overwrite leave data)
+        if join_rows:
+            existing = supabase.table("joins") \
+                .select("joined_user_id") \
+                .eq("user_id", uid) \
+                .eq("invite_link_id", invite_link_id) \
+                .not_.is_("left_at", "null") \
+                .execute()
+            already_left_ids: Set[int] = {int(row["joined_user_id"]) for row in (existing.data or [])}
+            join_rows = [r for r in join_rows if r["joined_user_id"] not in already_left_ids]
 
         # ✅ IMPORTANT FIX: UPSERT ONLY (never delete)
         upserted = sp_upsert_joins_for_link(uid, invite_link_id, join_rows)
         results[invite_link_id] = upserted
 
-        # tiny delay (safer for Telegram rate limits)
-        await asyncio.sleep(0.3)
+        # Rate-limit: random jitter delay between API calls
+        await asyncio.sleep(random.uniform(0.3, 0.5))
 
     return results
 
 
-# ---------------- COMMANDS ----------------
+# ---------------- REAL-TIME JOIN/LEAVE LISTENER ----------------
 
-@bot.on(events.NewMessage(pattern=r"^/sync_joins$"))
-async def cmd_sync_joins(e):
-    uid = e.sender_id
-    if not await is_logged_in(uid):
-        return await e.respond("🔒 Please /login first.", parse_mode="md")
+async def start_user_listeners(uid: int, client: TelegramClient):
+    """
+    Attach event listeners on the user client for real-time join/leave tracking.
 
-    await e.respond("⏳ Syncing join data from Telegram → DB (this may take some time)...")
+    Two listeners:
+    1. events.ChatAction  → groups/supergroups (user_joined / user_left)
+    2. events.Raw(UpdateChannelParticipant) → channels (join / leave / kick)
+    """
+    if uid in ACTIVE_LISTENERS:
+        return  # already attached
+    ACTIVE_LISTENERS.add(uid)
 
-    res = await sync_importers_to_db(uid, only_link_id=None)
-
-    if not res:
-        return await e.respond("⚠️ No links found to sync. Use /create_link first.")
-
-    done = sum(res.values())
-    lines = [f"✅ Synced links: `{len(res)}`", f"➕ Added/Updated rows: `{done}`"]
-    await e.respond("\n".join(lines), parse_mode="md")
-
-
-@bot.on(events.NewMessage(pattern=r"^/sync_all_links$"))
-async def cmd_sync_all_links(e):
-    uid = e.sender_id
-    if not await is_logged_in(uid):
-        return await e.respond("🔒 Please /login first.", parse_mode="md")
-
-    rows = sp_list_invite_links(uid)
-    if not rows:
-        return await e.respond("⚠️ No links found. Use /create_link first.")
-
-    await e.respond(f"⏳ Syncing ALL links (`{len(rows)}`) from Telegram → DB... (night run recommended)")
-
-    total = 0
-    ok = 0
-
-    for r in rows:
-        link_id = int(r["id"])
-        title = r.get("chat_title") or f"id:{r.get('chat_id')}"
+      # ── LISTENER 1: Groups / Supergroups ─────────────────────────────────────────────
+    @client.on(events.ChatAction)
+    async def _on_chat_action(event):
         try:
-            res = await sync_importers_to_db(uid, only_link_id=link_id)
-            added = res.get(link_id, 0)
-            total += added
-            ok += 1
-            await e.respond(f"✅ `{title}` → +`{added}`")
-        except FloodWaitError as fw:
-            await e.respond(f"⏳ FloodWait `{fw.seconds}s` for `{title}`. Waiting...")
-            await asyncio.sleep(fw.seconds + 5)
+            chat_id = int(event.chat_id)
+
+            # Only handle chats this user is tracking (use cache)
+            all_links = get_cached_invite_links(uid)
+            chat_links = [r for r in all_links if int(r.get("chat_id", 0)) == chat_id]
+            if not chat_links:
+                return
+
+            if event.user_joined or event.user_added:
+                joined_user_id = int(getattr(event, "user_id", 0) or 0)
+                if not joined_user_id:
+                    return
+                log_info(f"Real-time [group]: user {joined_user_id} joined chat {chat_id} (uid={uid})")
+
+                # 1️⃣ Insert immediately into DB (invite_link_id=None for now)
+                sp_realtime_join_insert(uid, chat_id, joined_user_id, joined_source="realtime_group")
+
+                # 2️⃣ Enqueue deferred sync to resolve correct invite_link_id
+                enqueue_sync(uid, chat_id)
+
+            elif event.user_left or event.user_kicked:
+                # User left/kicked → update left_at in DB immediately
+                left_uid_val = int(getattr(event, "user_id", 0) or 0)
+                if not left_uid_val:
+                    return
+                reason = "left" if event.user_left else "kicked"
+                now_iso = datetime.now(timezone.utc).isoformat()
+                try:
+                    supabase.table("joins").update({
+                        "left_at": now_iso,
+                        "left_reason": reason,
+                        "left_seen_at": now_iso,
+                    }).eq("user_id", uid).eq("chat_id", chat_id).eq(
+                        "joined_user_id", left_uid_val
+                    ).is_("left_at", "null").execute()
+                    log_info(f"Real-time [group]: user {left_uid_val} marked {reason} in chat {chat_id} (uid={uid})")
+                except Exception as ex:
+                    log_error(f"Real-time leave update error uid={uid}: {ex}")
+
         except Exception as ex:
-            await e.respond(f"❌ `{title}` sync failed: `{ex}`")
+            log_error(f"ChatAction handler error uid={uid}: {ex}")
 
-        await asyncio.sleep(0.6)
+    # ── LISTENER 2: Channels ────────────────────────────────────────────────
+    # ChatAction does NOT fire for Telegram channels.
+    # Channels generate UpdateChannelParticipant raw updates instead.
+    @client.on(events.Raw(UpdateChannelParticipant))
+    async def _on_channel_participant(event):
+        try:
+            # Convert bare channel_id → peer ID format used in DB (e.g. -1002922268649)
+            bare_id = int(getattr(event, "channel_id", 0) or 0)
+            if not bare_id:
+                return
+            chat_id = int(f"-100{bare_id}")
 
-    await e.respond(f"✅ Done. Links synced: `{ok}/{len(rows)}` | Total upserted: `{total}`", parse_mode="md")
+            # Only handle channels this user is tracking (use cache)
+            all_links = get_cached_invite_links(uid)
+            chat_links = [r for r in all_links if int(r.get("chat_id", 0)) == chat_id]
+            if not chat_links:
+                return
+
+            new_p = getattr(event, "new_participant", None)
+            prev_p = getattr(event, "prev_participant", None)
+            joined_user_id = int(getattr(event, "user_id", 0) or 0)
+            if not joined_user_id:
+                return
+
+            # ── JOIN: new participant is active (not banned/left) ──
+            is_now_active = new_p is not None and not isinstance(
+                new_p, (ChannelParticipantBanned, ChannelParticipantLeft)
+            )
+            was_inactive = prev_p is None or isinstance(
+                prev_p, (ChannelParticipantBanned, ChannelParticipantLeft)
+            )
+
+            if is_now_active and was_inactive:
+                log_info(f"Real-time [channel]: user {joined_user_id} joined chat {chat_id} (uid={uid})")
+
+                # ✅ Improved: check if event carries the invite link used
+                invite_obj = getattr(event, "invite", None)
+                invite_link_str = getattr(invite_obj, "link", None) if invite_obj else None
+
+                matched_link_id: Optional[int] = None
+                if invite_link_str:
+                    # Try to match directly against our stored links
+                    for link_row in chat_links:
+                        if link_row.get("invite_link") == invite_link_str:
+                            matched_link_id = int(link_row["id"])
+                            break
+
+                # 1️⃣ Immediate DB insert (with or without invite_link_id)
+                sp_realtime_join_insert(
+                    uid, chat_id, joined_user_id,
+                    invite_link_id=matched_link_id,
+                    joined_source="realtime_channel",
+                )
+
+                # 2️⃣ Enqueue deferred sync to confirm and fill invite_link_id
+                enqueue_sync(uid, chat_id)
+
+            # ── LEAVE / KICK: new participant is banned or left ──
+            elif isinstance(new_p, (ChannelParticipantBanned, ChannelParticipantLeft)):
+                reason = "kicked" if isinstance(new_p, ChannelParticipantBanned) else "left"
+                now_iso = datetime.now(timezone.utc).isoformat()
+                try:
+                    supabase.table("joins").update({
+                        "left_at": now_iso,
+                        "left_reason": reason,
+                        "left_seen_at": now_iso,
+                    }).eq("user_id", uid).eq("chat_id", chat_id).eq(
+                        "joined_user_id", joined_user_id
+                    ).is_("left_at", "null").execute()
+                    log_info(f"Real-time [channel]: user {joined_user_id} marked {reason} in chat {chat_id} (uid={uid})")
+                except Exception as ex:
+                    log_error(f"Real-time channel leave update error uid={uid}: {ex}")
+
+        except Exception as ex:
+            log_error(f"UpdateChannelParticipant handler error uid={uid}: {ex}")
+
+    log_info(f"✅ Real-time listeners attached (group + channel) for uid {uid}")
+
+    # Start sync queue worker if not already running
+    global _sync_worker_started
+    if not _sync_worker_started:
+        _sync_worker_started = True
+        asyncio.ensure_future(_sync_worker())
+        log_info("✅ Sync queue worker started")
 
 
-@bot.on(events.CallbackQuery(pattern=b"^sync_one:"))
-async def cb_sync_one(event):
-    uid = event.sender_id
-    link_id = int(event.data.decode().split(":")[1])
-
-    await event.edit("⏳ Syncing joins from Telegram…\nPlease wait.", buttons=None)
-
+async def _start_listener_after_login(uid: int):
+    """Delayed start of listener after login (gives temp client time to disconnect)."""
+    await asyncio.sleep(2)
     try:
-        await sync_importers_to_db(uid, only_link_id=link_id)
-        await event.edit(
-            "✅ **Sync completed successfully**\n\n"
-            "Now /stats will show accurate data.",
-            parse_mode="md",
-            buttons=[[Button.inline("✖ Close", data=b"stats_page:close")]]
-        )
-    except FloodWaitError as fw:
-        await asyncio.sleep(fw.seconds + 5)
-        await event.edit("⚠️ Telegram rate-limit hit. Try again later.")
+        uc = await get_user_client(uid)
+        await start_user_listeners(uid, uc)
     except Exception as ex:
-        await event.edit(f"❌ Sync failed: `{ex}`", parse_mode="md")
+        log_warning(f"Could not start listener after login uid={uid}: {ex}")
 
 
-@bot.on(events.CallbackQuery(pattern=b"^sync_cancel$"))
-async def cb_sync_cancel(event):
-    await event.edit("✖ Sync cancelled.", buttons=None)
+async def start_listeners_for_all_users():
+    """On bot startup: reattach real-time listeners for ALL active user sessions."""
+    try:
+        res = supabase.table("user_sessions").select("user_id").eq("is_active", True).execute()
+        for sess in (res.data or []):
+            uid = int(sess["user_id"])
+            try:
+                client = await get_user_client(uid)
+                await start_user_listeners(uid, client)
+            except Exception as ex:
+                log_warning(f"Could not attach listener for uid={uid}: {ex}")
+            await asyncio.sleep(0.5)
+    except Exception as ex:
+        log_error(f"start_listeners_for_all_users error: {ex}")
+
+
+async def auto_sync_loop():
+    """
+    Background loop: every 30 seconds, pull fresh join data from Telegram API.
+    Safety net in case real-time events were missed (e.g. bot was down).
+    """
+    await asyncio.sleep(10)  # short initial wait so listeners attach first
+    while True:
+        log_info("🔄 Auto-sync started for all users...")
+        try:
+            res = supabase.table("user_sessions").select("user_id").eq("is_active", True).execute()
+            for sess in (res.data or []):
+                uid = int(sess["user_id"])
+                try:
+                    await sync_importers_to_db(uid)
+                    log_info(f"✅ Auto-sync ok for uid={uid}")
+                except Exception as ex:
+                    log_error(f"Auto-sync failed for uid={uid}: {ex}")
+                await asyncio.sleep(2)
+        except Exception as ex:
+            log_error(f"auto_sync_loop error: {ex}")
+        log_info("✅ Auto-sync cycle complete.")
+        await asyncio.sleep(20 * 3600)  # run again every 20 hours
+
 
 
 async def _stats_template(
@@ -2176,25 +2282,6 @@ async def stats_today_cmd(e):
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     await _stats_template(e, "Today", since=start)
 
-@bot.on(events.NewMessage(pattern=r"^/yestarday$"))  # typo support
-async def yesterday_status_cmd(e):
-    uid = e.sender_id
-    if not await is_logged_in(uid):
-        return await e.respond("🔒 Please /login first.", parse_mode="md")
-
-    IST = timezone(timedelta(hours=5, minutes=30))
-    now_ist = datetime.now(IST)
-
-    # ✅ yesterday range in IST
-    y_start_ist = (now_ist - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    y_end_ist = y_start_ist + timedelta(days=1)
-
-    # store/filter in UTC timestamps (safe)
-    since_utc = y_start_ist.astimezone(timezone.utc)
-    until_utc = y_end_ist.astimezone(timezone.utc)
-
-    await _stats_template(e, label="Yesterday", since=since_utc, until=until_utc)
-
 
 
 @bot.on(events.NewMessage(pattern=r"^/week_status$"))
@@ -2204,6 +2291,109 @@ async def stats_week_cmd(e):
     await _stats_template(e, "Last 7 days", since=start)
 
 
+async def send_daily_report_to_user(uid: int):
+    """Generates and sends the daily join report to a specific user Telegram ID."""
+    try:
+        # 1. Sync latest data
+        await sync_importers_to_db(uid)
+
+        # 2. Get data for today
+        links = sp_list_invite_links(uid)
+        if not links:
+            return
+
+        IST = timezone(timedelta(hours=5, minutes=30))
+        now_ist = datetime.now(IST)
+        start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+        since_utc = start_ist.astimezone(timezone.utc)
+
+        report_data = []
+        for r in links:
+            link_id = int(r["id"])
+            count = sp_count_joins_for_link(uid, link_id, since=since_utc)
+            if count > 0:
+                report_data.append({
+                    "chat_title": r.get("chat_title") or f"id:{r.get('chat_id')}",
+                    "invite_link": r.get("invite_link", "-"),
+                    "count": count
+                })
+
+        if not report_data:
+            return False
+
+        # 3. Generate Reports
+        excel_file = generate_today_excel_report(report_data)
+        graph_file = generate_today_graph_report(report_data)
+        text_report = generate_today_text_report(report_data)
+
+        try:
+            # 4. Send Reports
+            await bot.send_message(uid, text_report, parse_mode="md")
+
+            if os.path.exists(excel_file):
+                await bot.send_file(uid, excel_file, caption=f"📊 Daily Excel Report ({now_ist.strftime('%d-%m-%Y')})")
+
+            if os.path.exists(graph_file):
+                await bot.send_file(uid, graph_file, caption=f"📉 Daily Bar Graph ({now_ist.strftime('%d-%m-%Y')})")
+        finally:
+            # Cleanup
+            for f in [excel_file, graph_file]:
+                if os.path.exists(f):
+                    try:
+                        os.remove(f)
+                    except Exception as e:
+                        log_error(f"Failed to delete temporary report file {f}: {e}")
+        return True
+    except Exception as e:
+        log_error(f"Error in send_daily_report_to_user for {uid}: {e}")
+        return False
+
+
+async def scheduled_report_loop():
+    """Background task to send reports every day at 6 PM IST."""
+    IST = timezone(timedelta(hours=5, minutes=30))
+    log_info("⏰ Scheduled report loop started (Target: 06:00 PM IST daily)")
+    
+    while True:
+        now_ist = datetime.now(IST)
+        # Calculate next 6 PM IST
+        target = now_ist.replace(hour=18, minute=0, second=0, microsecond=0)
+        if now_ist >= target:
+            target += timedelta(days=1)
+        
+        sleep_seconds = (target - now_ist).total_seconds()
+        log_info(f"Next scheduled report in {sleep_seconds/3600:.2f} hours (at {target})")
+        
+        await asyncio.sleep(max(0.0, sleep_seconds))
+        
+        # Trigger report
+        log_info("🔔 Triggering scheduled daily reports...")
+        try:
+            session_res = supabase.table("user_sessions").select("user_id").eq("is_active", True).execute()
+            active_uids = [row["user_id"] for row in (session_res.data or [])]
+            
+            for uid in active_uids:
+                await send_daily_report_to_user(uid)
+                await asyncio.sleep(2) # small stagger
+        except Exception as e:
+            log_error(f"Error in scheduled_report_loop execution: {e}")
+
+
+@bot.on(events.NewMessage(pattern=r"^/stats_today$"))
+@safe_event_handler
+async def cmd_stats_today(event):
+    uid = event.sender_id
+    if not await is_logged_in(uid):
+        return await event.respond("🔒 Please /login first.", parse_mode="md")
+
+    status_msg = await event.respond("⏳ Generating your daily report... Please wait.")
+    found = await send_daily_report_to_user(uid)
+    await status_msg.delete()
+    
+    if not found:
+        await event.respond("ℹ️ **No users joined** on any of your links today.", parse_mode="md")
+
+
 @bot.on(events.NewMessage(pattern=r"^/month_status$"))
 async def stats_month_cmd(e):
     now = datetime.now(timezone.utc)
@@ -2211,15 +2401,14 @@ async def stats_month_cmd(e):
     await _stats_template(e, "Last 30 days", since=start)
 
 
-@bot.on(events.NewMessage(pattern=r"^/year_status$"))
-async def stats_year_cmd(e):
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(days=365)
-    await _stats_template(e, "Last 365 days", since=start)
-    
+
 async def setup_bot_profile():
-    """Set bot description + commands list."""
+    """Sets the bot name and commands once on start."""
     try:
+        # ✅ Ensure bot is started within the current async loop
+        if not bot.is_connected():
+            await bot.start(bot_token=BOT_TOKEN)
+            
         me = await bot.get_me()
         await bot(
             functions.bots.SetBotInfoRequest(
@@ -2248,7 +2437,6 @@ async def setup_bot_profile():
             ("today_status", "Select link & joins today"),
             ("week_status", "Select link & joins last 7 days"),
             ("month_status", "Select link & joins last 30 days"),
-            ("year_status", "Select link & joins last 365 days"),
             
         ]
         await bot(
@@ -2263,34 +2451,60 @@ async def setup_bot_profile():
 
 # ---------------- RUN ----------------
 
+async def main_async():
+    """Single async entry point for the entire bot process."""
+    global _sync_worker_started
+    
+    log_info("Initializing bot profile...")
+    try:
+        await setup_bot_profile()
+        log_info("✅ Bot profile setup complete")
+    except Exception as e:
+        log_warning(f"Profile setup failed (non-critical): {e}")
+
+    # Reattach real-time listeners for all active user sessions
+    try:
+        await start_listeners_for_all_users()
+        log_info("✅ Real-time listeners attached for all active users")
+    except Exception as e:
+        log_warning(f"Listener attachment failed (non-critical): {e}")
+
+    # Schedule background auto-sync task (runs every 20 hours)
+    asyncio.create_task(auto_sync_loop())
+    log_info("✅ Auto-sync loop scheduled (runs every 20 hours)")
+    
+    # Schedule daily 6 PM IST report
+    asyncio.create_task(scheduled_report_loop())
+    log_info("✅ Scheduled report loop active")
+
+    # Ensure sync queue worker is running
+    if not _sync_worker_started:
+        _sync_worker_started = True
+        asyncio.create_task(_sync_worker())
+        log_info("✅ Sync queue worker started")
+
+    log_info("🤖 Join Counter Bot ready! Starting main loop...")
+    
+    # Main bot loop will run forever until disconnected
+    await bot.run_until_disconnected()
+
+
 if __name__ == "__main__":
-    log_info("🤖 Join Counter Bot starting...")
+    import time
     
     # Auto-reconnect loop to prevent crashes
-    max_retries = 0  # Infinite retries (0 = unlimited)
     retry_count = 0
-    base_delay = 5  # Start with 5 seconds
-    max_delay = 300  # Max 5 minutes between retries
+    base_delay = 5  
+    max_delay = 300 
     
     while True:
         try:
-            log_info("Initializing bot profile...")
-            loop = asyncio.get_event_loop()
-            try:
-                loop.run_until_complete(setup_bot_profile())
-                log_info("✅ Bot profile setup complete")
-            except Exception as e:
-                log_warning(f"Profile setup failed (non-critical): {e}")
+            # Single entry point: asyncio.run creates and manages its own loop
+            asyncio.run(main_async())
             
-            log_info("🤖 Join Counter Bot ready! Starting main loop...")
-            retry_count = 0  # Reset retry count on successful start
-            
-            # Main bot loop
-            bot.run_until_disconnected()
-            
-            # If we reach here, bot disconnected gracefully
-            log_info("Bot disconnected gracefully. Exiting.")
-            break
+            log_info("Bot disconnected. Reconnecting in 5 seconds...")
+            time.sleep(5)
+            continue
             
         except KeyboardInterrupt:
             log_info("🛑 Bot stopped by user (Ctrl+C)")
@@ -2300,19 +2514,9 @@ if __name__ == "__main__":
             retry_count += 1
             log_error(f"❌ Bot crashed: {type(e).__name__}: {e}", exc_info=True)
             
-            # Calculate delay with exponential backoff
-            if max_retries > 0 and retry_count >= max_retries:
-                log_error(f"Max retries ({max_retries}) reached. Exiting.")
-                break
-            
             delay = min(base_delay * (2 ** (retry_count - 1)), max_delay)
             log_info(f"🔄 Restarting bot in {delay} seconds... (attempt {retry_count})")
-            
-            try:
-                asyncio.run(asyncio.sleep(delay))
-            except KeyboardInterrupt:
-                log_info("🛑 Bot stopped during restart delay")
-                break
+            time.sleep(delay)
     
     log_info("Bot shutdown complete.")
 
